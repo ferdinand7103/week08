@@ -102,4 +102,5 @@ def health_check() -> dict[str, str]:
     return {
         "status": "healthy",
         "service": "student-service",
+        "release": "8.1P-cd-demo",
     }
