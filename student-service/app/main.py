@@ -101,5 +101,5 @@ def root() -> dict[str, str]:
 def health_check() -> dict[str, str]:
     return {
         "status": "healthy",
-        "release": "9.3C-auto-cd",
+        "release": "9.3C-teal",
     }
