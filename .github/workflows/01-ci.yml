@@ -5,7 +5,12 @@ on:
   push:
     branches:
       - main
-  
+
+  # Run the tests on pull requests so problems are caught before merge
+  pull_request:
+    branches:
+      - main
+
   # Manual trigger for the workflow
   workflow_dispatch:
 
