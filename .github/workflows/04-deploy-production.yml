@@ -1,4 +1,3 @@
-name: 04 - Deploy to Production
 
 on:
   # Continuous Deployment: runs automatically once staging has been tested
