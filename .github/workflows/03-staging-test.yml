@@ -14,7 +14,7 @@ jobs:
     name: Staging Smoke Test
     runs-on: ubuntu-latest
 
-    if: >
+    if: >-
       ${{ github.event.workflow_run.conclusion == 'success' }}
 
     environment:
@@ -61,3 +61,41 @@ jobs:
             --retry 10 \
             --retry-delay 5 \
             http://${{ env.FRONTEND_IP }}
+
+      - name: Test backend services through the frontend
+        run: |
+          # This also creates some real traffic for the Grafana dashboard
+          for svc in users students lecturers courses enrollments; do
+            for i in {1..20}; do
+              curl --fail --silent --retry 5 --retry-delay 5 \
+                http://${{ env.FRONTEND_IP }}/api/$svc/health > /dev/null
+            done
+            echo "$svc: healthy"
+          done
+
+      - name: Check /metrics is not public
+        run: |
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            http://${{ env.FRONTEND_IP }}/api/users/metrics)
+          echo "Public /metrics returned HTTP $CODE"
+          [ "$CODE" = "404" ]
+
+      - name: Validate Prometheus is scraping staging
+        run: |
+          kubectl port-forward -n monitoring svc/prometheus-operated 9090:9090 > /dev/null 2>&1 &
+          sleep 8
+
+          # New pods were just rolled out, wait up to 2 minutes for them to be scraped
+          for i in {1..12}; do
+            UP=$(curl -s http://localhost:9090/api/v1/query \
+              --data-urlencode 'query=count(up{namespace="staging", service=~".+-service"} == 1)' \
+              | jq -r '.data.result[0].value[1] // "0"')
+            if [ "$UP" -ge 5 ]; then break; fi
+            echo "Staging services scraped so far: $UP"
+            sleep 10
+          done
+
+          echo "Staging services scraped by Prometheus: $UP of 5"
+          echo "Staging services scraped by Prometheus: **$UP of 5**" >> "$GITHUB_STEP_SUMMARY"
+
+          [ "$UP" -ge 5 ]

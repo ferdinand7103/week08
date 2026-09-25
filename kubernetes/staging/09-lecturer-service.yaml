@@ -57,9 +57,13 @@ kind: Service
 metadata:
   name: lecturer-service
   namespace: staging
+  labels:
+    app: lecturer-service
+    monitoring: enabled
 spec:
   selector:
     app: lecturer-service
   ports:
-    - port: 8000
+    - name: http
+      port: 8000
       targetPort: 8000

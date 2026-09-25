@@ -57,9 +57,13 @@ kind: Service
 metadata:
   name: student-service
   namespace: production
+  labels:
+    app: student-service
+    monitoring: enabled
 spec:
   selector:
     app: student-service
   ports:
-    - port: 8000
+    - name: http
+      port: 8000
       targetPort: 8000

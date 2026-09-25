@@ -50,9 +50,13 @@ kind: Service
 metadata:
   name: course-service
   namespace: production
+  labels:
+    app: course-service
+    monitoring: enabled
 spec:
   selector:
     app: course-service
   ports:
-    - port: 8000
+    - name: http
+      port: 8000
       targetPort: 8000

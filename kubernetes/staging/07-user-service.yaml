@@ -67,9 +67,13 @@ kind: Service
 metadata:
   name: user-service
   namespace: staging
+  labels:
+    app: user-service
+    monitoring: enabled
 spec:
   selector:
     app: user-service
   ports:
-    - port: 8000
+    - name: http
+      port: 8000
       targetPort: 8000

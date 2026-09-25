@@ -4,6 +4,7 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from prometheus_fastapi_instrumentator import Instrumentator
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
@@ -118,6 +119,10 @@ app = FastAPI(
 
 app.include_router(auth.router)
 app.include_router(users.router)
+
+
+# Expose Prometheus metrics (request count, latency, status codes) on /metrics
+Instrumentator().instrument(app).expose(app, include_in_schema=False)
 
 
 @app.get(
