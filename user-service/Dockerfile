@@ -4,6 +4,9 @@ WORKDIR /app
 
 COPY requirements.txt .
 
+# Upgrade pip, the pip in the base image has known CVEs (Docker Scout)
+RUN pip install --no-cache-dir --root-user-action=ignore --upgrade pip
+
 RUN pip install \
     --no-cache-dir \
     --root-user-action=ignore \
