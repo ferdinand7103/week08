@@ -1,0 +1,21 @@
+# Tells Prometheus to scrape /metrics from every KoalaTech backend service
+# in the staging and production namespaces (Services labelled monitoring=enabled)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: koalatech-services
+  namespace: monitoring
+  labels:
+    app: koalatech
+spec:
+  namespaceSelector:
+    matchNames:
+      - staging
+      - production
+  selector:
+    matchLabels:
+      monitoring: enabled
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s

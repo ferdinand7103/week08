@@ -1,0 +1,48 @@
+# Helm values for kube-prometheus-stack (Prometheus + Grafana + exporters)
+# Installed into the "monitoring" namespace by the 00 - Infrastructure workflow.
+
+# Short, predictable names: Prometheus service = kps-prometheus
+fullnameOverride: kps
+
+# Alertmanager is not needed for this task, turned off to save cluster resources
+alertmanager:
+  enabled: false
+
+# AKS is a managed cluster, these control plane parts are run by Azure and
+# cannot be scraped, so turn them off to avoid targets that are always "down"
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeEtcd:
+  enabled: false
+kubeProxy:
+  enabled: false
+
+prometheus:
+  prometheusSpec:
+    # Pick up ServiceMonitors from any namespace, not only ones made by this chart
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    scrapeInterval: 15s
+    retention: 3d
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        memory: 2Gi
+
+grafana:
+  fullnameOverride: grafana
+  # adminPassword is passed in from a GitHub secret with --set, never stored in git
+  defaultDashboardsTimezone: Australia/Melbourne
+  service:
+    type: ClusterIP
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      searchNamespace: ALL
