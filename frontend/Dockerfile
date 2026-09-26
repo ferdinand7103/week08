@@ -24,7 +24,15 @@ RUN npm run build
 
 FROM nginx:stable-alpine
 
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+# The nginx image renders files in /etc/nginx/templates into conf.d when the
+# container starts, replacing ${COLOUR} and ${APP_VERSION}. The filter makes
+# sure no other nginx variable (like $host) is touched. The defaults keep
+# staging working, where these variables are not set.
+ENV COLOUR=none \
+    APP_VERSION=dev \
+    NGINX_ENVSUBST_FILTER="COLOUR|APP_VERSION"
+
+COPY nginx.conf /etc/nginx/templates/default.conf.template
 
 COPY --from=build /app/dist /usr/share/nginx/html
 

@@ -1,0 +1,36 @@
+# The PRIVATE preview services. ClusterIP only, so nobody on the internet can
+# reach them. They always point at the IDLE colour, so the pipeline can test
+# the new version before any user is sent to it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: course-service-preview
+  namespace: production
+  labels:
+    app: course-service
+spec:
+  type: ClusterIP
+  selector:
+    app: course-service
+    version: ${IDLE_COLOUR}
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-preview
+  namespace: production
+  labels:
+    app: frontend
+spec:
+  type: ClusterIP
+  selector:
+    app: frontend
+    version: ${IDLE_COLOUR}
+  ports:
+    - port: 80
+      targetPort: 80

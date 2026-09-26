@@ -1,0 +1,45 @@
+# Blue/green template for the frontend (Task 10.3HD).
+# Rendered by the pipeline with envsubst for ONE colour at a time.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-${COLOUR}
+  namespace: production
+  labels:
+    app: frontend
+    version: ${COLOUR}
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frontend
+      version: ${COLOUR}
+  template:
+    metadata:
+      labels:
+        app: frontend
+        version: ${COLOUR}
+    spec:
+      containers:
+        - name: frontend
+          image: ${IMAGE}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 80
+          env:
+            - name: COLOUR
+              value: "${COLOUR}"
+            - name: APP_VERSION
+              value: "${APP_VERSION}"
+          readinessProbe:
+            httpGet:
+              path: /colour
+              port: 80
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /colour
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 10
