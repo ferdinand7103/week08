@@ -1,25 +1,44 @@
+# Blue/green template for course-service (Task 10.3HD).
+# The pipeline renders this with envsubst for ONE colour at a time:
+#   COLOUR       blue or green
+#   IMAGE        full image name with the commit SHA tag
+#   APP_VERSION  the commit SHA, shown by /health
+#   DEMO_FAULT   none, broken-api or late-errors (demo only)
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: course-service
+  name: course-service-${COLOUR}
   namespace: production
+  labels:
+    app: course-service
+    version: ${COLOUR}
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: course-service
+      version: ${COLOUR}
   template:
     metadata:
       labels:
         app: course-service
+        version: ${COLOUR}
     spec:
       containers:
         - name: course-service
-          image: placeholder
+          image: ${IMAGE}
           imagePullPolicy: Always
           ports:
             - containerPort: 8000
           env:
+            - name: COLOUR
+              value: "${COLOUR}"
+            - name: APP_VERSION
+              value: "${APP_VERSION}"
+            - name: DEMO_FAULT
+              value: "${DEMO_FAULT}"
+            - name: FAULT_AFTER_REQUESTS
+              value: "25"
             - name: POSTGRES_USER
               valueFrom:
                 secretKeyRef:
@@ -43,20 +62,15 @@ spec:
                   key: JWT_SECRET_KEY
             - name: JWT_ALGORITHM
               value: HS256
-
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: course-service
-  namespace: production
-  labels:
-    app: course-service
-    monitoring: enabled
-spec:
-  selector:
-    app: course-service
-  ports:
-    - name: http
-      port: 8000
-      targetPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 20
+            periodSeconds: 10

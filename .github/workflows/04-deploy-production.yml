@@ -1,4 +1,4 @@
-name: 04 - Deploy to Production
+name: 04 - Deploy to Production (Blue/Green)
 
 on:
   # Continuous Deployment: runs automatically once staging has been tested
@@ -10,17 +10,41 @@ on:
     branches:
       - main
 
-  # Kept as a manual escape hatch, for redeploying an older tested image
+  # Manual run: redeploy an older tested image, or run one of the demo faults
   workflow_dispatch:
     inputs:
       image_tag:
         description: "Tested image SHA to deploy"
         required: true
         type: string
+      demo_fault:
+        description: "Demo only: inject a fault into the new colour"
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+          - broken-api
+          - late-errors
+
+# Only one production release at a time, so two runs can never fight over the switch
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+env:
+  NAMESPACE: production
+  # How long to watch the new colour after the swap, and when to give up on it
+  WATCH_SECONDS: "180"
+  MAX_ERROR_PERCENT: "5"
+  MIN_REQUESTS: "30"
+  MAX_PROM_5XX_PER_SECOND: "0.2"
+  # Only the variables listed here are replaced by envsubst
+  TEMPLATE_VARS: "$COLOUR $IMAGE $APP_VERSION $DEMO_FAULT $LIVE_COLOUR $IDLE_COLOUR"
 
 jobs:
   deploy-production:
-    name: Deploy to Production
+    name: Blue/Green Deploy to Production
     runs-on: ubuntu-latest
 
     if: >-
@@ -30,26 +54,28 @@ jobs:
     environment:
       name: production
 
+    env:
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      ADMIN_USERNAME: ${{ secrets.DEFAULT_ADMIN_USERNAME }}
+      ADMIN_PASSWORD: ${{ secrets.DEFAULT_ADMIN_PASSWORD }}
+
     steps:
       - name: Checkout tested commit
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
-      - name: Resolve image tag
+      - name: Resolve image tag and demo fault
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "Manual run, using the tag that was typed in."
             echo "IMAGE_TAG=${{ inputs.image_tag }}" >> "$GITHUB_ENV"
+            echo "DEMO_FAULT=${{ inputs.demo_fault }}" >> "$GITHUB_ENV"
           else
             echo "Automatic run, promoting the commit that passed staging."
             echo "IMAGE_TAG=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_ENV"
+            echo "DEMO_FAULT=none" >> "$GITHUB_ENV"
           fi
-
-      - name: Show what is being deployed
-        run: |
-          echo "Trigger:   ${{ github.event_name }}"
-          echo "Image tag: $IMAGE_TAG"
 
       - name: Login to Azure
         uses: azure/login@v3
@@ -65,23 +91,21 @@ jobs:
 
       - name: Create production namespace
         run: |
-          kubectl create namespace production \
-            --dry-run=client \
-            -o yaml | kubectl apply -f -
+          kubectl create namespace "$NAMESPACE" \
+            --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Create PostgreSQL secret
         run: |
           kubectl create secret generic postgres-secret \
-            --namespace production \
+            --namespace "$NAMESPACE" \
             --from-literal=POSTGRES_USER="${{ secrets.POSTGRES_USER }}" \
             --from-literal=POSTGRES_PASSWORD="${{ secrets.POSTGRES_PASSWORD }}" \
-            --dry-run=client \
-            -o yaml | kubectl apply -f -
+            --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Create application secret
         run: |
           kubectl create secret generic application-secret \
-            --namespace production \
+            --namespace "$NAMESPACE" \
             --from-literal=POSTGRES_USER="${{ secrets.POSTGRES_USER }}" \
             --from-literal=POSTGRES_PASSWORD="${{ secrets.POSTGRES_PASSWORD }}" \
             --from-literal=JWT_SECRET_KEY="${{ secrets.JWT_SECRET_KEY }}" \
@@ -89,90 +113,303 @@ jobs:
             --from-literal=DEFAULT_ADMIN_EMAIL="${{ secrets.DEFAULT_ADMIN_EMAIL }}" \
             --from-literal=DEFAULT_ADMIN_PASSWORD="${{ secrets.DEFAULT_ADMIN_PASSWORD }}" \
             --from-literal=AZURE_STORAGE_CONNECTION_STRING="${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}" \
-            --dry-run=client \
-            -o yaml | kubectl apply -f -
+            --dry-run=client -o yaml | kubectl apply -f -
 
-      - name: Apply Kubernetes manifests
+      # Databases and the four services that are not blue/green.
+      # kubectl apply is not recursive, so the bluegreen/ folder is skipped here.
+      - name: Apply shared manifests
         run: |
-          kubectl apply \
-            -f kubernetes/production/
+          kubectl apply -f kubernetes/production/
 
-      - name: Update frontend image
+      - name: Update the services that are not blue/green
         run: |
-          kubectl set image deployment/frontend \
-            frontend=${{ vars.ACR_LOGIN_SERVER }}/koalatech-frontend:$IMAGE_TAG \
-            -n production
+          for svc in user-service student-service lecturer-service enrollment-service; do
+            kubectl set image "deployment/$svc" \
+              "$svc=${{ vars.ACR_LOGIN_SERVER }}/koalatech-$svc:$IMAGE_TAG" \
+              -n "$NAMESPACE"
+          done
+          for svc in user-service student-service lecturer-service enrollment-service; do
+            kubectl rollout status "deployment/$svc" -n "$NAMESPACE" --timeout=300s
+          done
 
-      - name: Update user-service image
-        run: |
-          kubectl set image deployment/user-service \
-            user-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-user-service:$IMAGE_TAG \
-            -n production
+      # ===================================================================
+      # Blue/green starts here
+      # ===================================================================
 
-      - name: Update student-service image
+      - name: Work out the live and idle colour
+        id: colours
         run: |
-          kubectl set image deployment/student-service \
-            student-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-student-service:$IMAGE_TAG \
-            -n production
+          # The old single colour Deployments (before Task 10.3HD) are replaced
+          kubectl delete deployment frontend course-service \
+            -n "$NAMESPACE" --ignore-not-found
 
-      - name: Update lecturer-service image
-        run: |
-          kubectl set image deployment/lecturer-service \
-            lecturer-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-lecturer-service:$IMAGE_TAG \
-            -n production
+          LIVE=$(kubectl get service frontend -n "$NAMESPACE" \
+            -o jsonpath='{.spec.selector.version}' 2>/dev/null || true)
 
-      - name: Update course-service image
-        run: |
-          kubectl set image deployment/course-service \
-            course-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-course-service:$IMAGE_TAG \
-            -n production
+          if [ "$LIVE" = "blue" ] || [ "$LIVE" = "green" ]; then
+            if [ "$LIVE" = "blue" ]; then IDLE=green; else IDLE=blue; fi
+            echo "Live colour is $LIVE, the new version goes to $IDLE."
+          else
+            # First blue/green release: create the public services pointing at
+            # blue BEFORE the frontend starts (nginx needs course-service to exist)
+            LIVE=none
+            IDLE=blue
+            echo "No live colour yet, this is the first blue/green release."
+            LIVE_COLOUR=blue envsubst "$TEMPLATE_VARS" \
+              < kubernetes/production/bluegreen/services-live.yaml \
+              | kubectl apply -f -
+          fi
 
-      - name: Update enrollment-service image
-        run: |
-          kubectl set image deployment/enrollment-service \
-            enrollment-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-enrollment-service:$IMAGE_TAG \
-            -n production
+          echo "live=$LIVE" >> "$GITHUB_OUTPUT"
+          echo "idle=$IDLE" >> "$GITHUB_OUTPUT"
 
-      - name: Wait for frontend rollout
+      - name: Deploy the new version to the idle colour
+        env:
+          IDLE: ${{ steps.colours.outputs.idle }}
         run: |
-          kubectl rollout status deployment/frontend \
-            -n production \
-            --timeout=300s
+          export COLOUR="$IDLE"
+          export APP_VERSION="$IMAGE_TAG"
+          export DEMO_FAULT
 
-      - name: Wait for user-service rollout
-        run: |
-          kubectl rollout status deployment/user-service \
-            -n production \
-            --timeout=300s
+          IMAGE="${{ vars.ACR_LOGIN_SERVER }}/koalatech-course-service:$IMAGE_TAG" \
+            envsubst "$TEMPLATE_VARS" < kubernetes/production/bluegreen/course-service.yaml \
+            | kubectl apply -f -
 
-      - name: Wait for student-service rollout
-        run: |
-          kubectl rollout status deployment/student-service \
-            -n production \
-            --timeout=300s
+          IMAGE="${{ vars.ACR_LOGIN_SERVER }}/koalatech-frontend:$IMAGE_TAG" \
+            envsubst "$TEMPLATE_VARS" < kubernetes/production/bluegreen/frontend.yaml \
+            | kubectl apply -f -
 
-      - name: Wait for lecturer-service rollout
-        run: |
-          kubectl rollout status deployment/lecturer-service \
-            -n production \
-            --timeout=300s
+          kubectl rollout status "deployment/course-service-$IDLE" -n "$NAMESPACE" --timeout=240s
+          kubectl rollout status "deployment/frontend-$IDLE" -n "$NAMESPACE" --timeout=240s
 
-      - name: Wait for course-service rollout
+      - name: Point the private preview services at the idle colour
+        env:
+          IDLE_COLOUR: ${{ steps.colours.outputs.idle }}
         run: |
-          kubectl rollout status deployment/course-service \
-            -n production \
-            --timeout=300s
+          envsubst "$TEMPLATE_VARS" < kubernetes/production/bluegreen/services-preview.yaml \
+            | kubectl apply -f -
 
-      - name: Wait for enrollment-service rollout
+      - name: Smoke test the idle colour (no user can reach it yet)
+        id: smoke
+        env:
+          IDLE: ${{ steps.colours.outputs.idle }}
         run: |
-          kubectl rollout status deployment/enrollment-service \
-            -n production \
-            --timeout=300s
+          set -euo pipefail
 
-      - name: Show production resources
+          # Reach the private ClusterIP services from the runner
+          kubectl port-forward -n "$NAMESPACE" svc/frontend-preview 8081:80 > /dev/null 2>&1 &
+          kubectl port-forward -n "$NAMESPACE" svc/course-service-preview 8082:8000 > /dev/null 2>&1 &
+          kubectl port-forward -n "$NAMESPACE" svc/user-service 8083:8000 > /dev/null 2>&1 &
+          sleep 6
+
+          echo "1. Frontend ($IDLE) serves the React app"
+          curl -sf --retry 5 --retry-delay 2 --retry-all-errors http://localhost:8081/ | grep -q 'id="root"'
+
+          echo "2. Frontend preview really is the $IDLE colour"
+          curl -sf http://localhost:8081/colour | tee /dev/stderr | jq -e --arg c "$IDLE" '.colour == $c' > /dev/null
+
+          echo "3. course-service ($IDLE) is healthy and runs the new image"
+          curl -sf --retry 5 --retry-delay 2 --retry-all-errors http://localhost:8082/health \
+            | tee /dev/stderr \
+            | jq -e --arg c "$IDLE" --arg v "$IMAGE_TAG" '.colour == $c and .version == $v' > /dev/null
+
+          echo "4. Log in through user-service and get a JWT"
+          TOKEN=$(curl -sf -X POST http://localhost:8083/auth/login \
+            --data-urlencode "username=$ADMIN_USERNAME" \
+            --data-urlencode "password=$ADMIN_PASSWORD" | jq -r '.access_token')
+          [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]
+
+          echo "5. Real API call on the new version, 10 times"
+          for _ in $(seq 1 10); do
+            CODE=$(curl -s -o /tmp/courses.json -w "%{http_code}" \
+              -H "Authorization: Bearer $TOKEN" http://localhost:8082/courses)
+            if [ "$CODE" != "200" ]; then
+              echo "::error::GET /courses on $IDLE returned HTTP $CODE, the swap will NOT happen"
+              cat /tmp/courses.json
+              exit 1
+            fi
+          done
+          jq -e 'type == "array"' /tmp/courses.json > /dev/null
+
+          echo "6. Security still works: no token means 401"
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8082/courses)
+          [ "$CODE" = "401" ]
+
+          echo "Smoke test passed on $IDLE" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Swap live traffic to the new colour
+        id: swap
+        env:
+          IDLE: ${{ steps.colours.outputs.idle }}
         run: |
-          kubectl get pods -n production
-          kubectl get services -n production
-          kubectl get deployment frontend -n production \
-            -o jsonpath='{.spec.template.spec.containers[0].image}'
-          echo
+          # One patch per service. Both colours are already running and ready,
+          # so no pod restarts and no request is dropped.
+          kubectl patch service course-service -n "$NAMESPACE" \
+            -p "{\"spec\":{\"selector\":{\"app\":\"course-service\",\"version\":\"$IDLE\"}}}"
+          kubectl patch service frontend -n "$NAMESPACE" \
+            -p "{\"spec\":{\"selector\":{\"app\":\"frontend\",\"version\":\"$IDLE\"}}}"
+
+          echo "Swapped at $(date -u +%H:%M:%S) UTC"
+          kubectl get service frontend course-service -n "$NAMESPACE" \
+            -o custom-columns=NAME:.metadata.name,VERSION:.spec.selector.version
+
+      - name: Watch the new colour after the swap
+        id: watch
+        env:
+          NEW: ${{ steps.colours.outputs.idle }}
+        run: |
+          set -uo pipefail
+
+          # Public IP of the site (on the first release it can take a minute)
+          for _ in $(seq 1 30); do
+            IP=$(kubectl get service frontend -n "$NAMESPACE" \
+              -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            [ -n "$IP" ] && break
+            echo "Waiting for the public IP..."
+            sleep 10
+          done
+          echo "PUBLIC_IP=$IP" >> "$GITHUB_ENV"
+          echo "Public site: http://$IP"
+
+          TOKEN=$(curl -s --retry 5 --retry-all-errors -X POST "http://$IP/api/users/auth/login" \
+            --data-urlencode "username=$ADMIN_USERNAME" \
+            --data-urlencode "password=$ADMIN_PASSWORD" | jq -r '.access_token')
+
+          # Prometheus from Task 10.2D is a second pair of eyes
+          kubectl port-forward -n monitoring svc/prometheus-operated 9090:9090 > /dev/null 2>&1 &
+          PROM_QUERY='sum(rate(http_requests_total{namespace="production",service="course-service",status="5xx"}[1m])) or vector(0)'
+
+          TOTAL=0
+          FAILED=0
+          END=$(( $(date +%s) + WATCH_SECONDS ))
+
+          fail() {
+            echo "::error::$1"
+            {
+              echo "ROLLBACK_REASON=$1"
+              echo "WATCH_TOTAL=$TOTAL"
+              echo "WATCH_FAILED=$FAILED"
+            } >> "$GITHUB_ENV"
+            exit 1
+          }
+
+          while [ "$(date +%s)" -lt "$END" ]; do
+            # 1. Real user traffic through the public address
+            for _ in $(seq 1 10); do
+              CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+                -H "Authorization: Bearer $TOKEN" "http://$IP/api/courses/courses")
+              TOTAL=$((TOTAL + 1))
+              case "$CODE" in
+                2*) ;;
+                *) FAILED=$((FAILED + 1)) ;;
+              esac
+            done
+            PERCENT=$(( FAILED * 100 / TOTAL ))
+
+            # 2. Are the new pods still ready?
+            READY=$(kubectl get deployment "course-service-$NEW" -n "$NAMESPACE" \
+              -o jsonpath='{.status.readyReplicas}')
+            READY=${READY:-0}
+
+            # 3. What does Prometheus say about 5xx on the live service?
+            PROM=$(curl -s --max-time 5 http://localhost:9090/api/v1/query \
+              --data-urlencode "query=$PROM_QUERY" \
+              | jq -r '.data.result[0].value[1] // "0"' 2>/dev/null || echo 0)
+            PROM=${PROM:-0}
+
+            echo "$(date -u +%H:%M:%S)  requests=$TOTAL  failed=$FAILED (${PERCENT}%)  ready_pods=$READY  prometheus_5xx_per_s=$PROM"
+
+            if [ "$TOTAL" -ge "$MIN_REQUESTS" ] && [ "$PERCENT" -gt "$MAX_ERROR_PERCENT" ]; then
+              fail "Error rate ${PERCENT}% is over ${MAX_ERROR_PERCENT}% ($FAILED of $TOTAL requests failed)"
+            fi
+            if [ "$READY" -lt 1 ]; then
+              fail "No ready course-service pods left in $NEW"
+            fi
+            if awk -v p="$PROM" -v m="$MAX_PROM_5XX_PER_SECOND" 'BEGIN { exit !(p > m) }'; then
+              fail "Prometheus shows $PROM server errors per second on course-service"
+            fi
+
+            sleep 5
+          done
+
+          echo "Watch passed: $FAILED of $TOTAL requests failed in ${WATCH_SECONDS}s" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Automatic rollback
+        if: ${{ failure() && steps.watch.outcome == 'failure' && steps.colours.outputs.live != 'none' }}
+        env:
+          OLD: ${{ steps.colours.outputs.live }}
+          NEW: ${{ steps.colours.outputs.idle }}
+        run: |
+          echo "Rolling back from $NEW to $OLD. Reason: $ROLLBACK_REASON"
+
+          kubectl patch service course-service -n "$NAMESPACE" \
+            -p "{\"spec\":{\"selector\":{\"app\":\"course-service\",\"version\":\"$OLD\"}}}"
+          kubectl patch service frontend -n "$NAMESPACE" \
+            -p "{\"spec\":{\"selector\":{\"app\":\"frontend\",\"version\":\"$OLD\"}}}"
+
+          sleep 5
+          echo "Public site now says:"
+          curl -s "http://$PUBLIC_IP/colour"; echo
+          curl -s "http://$PUBLIC_IP/api/courses/health"; echo
+          curl -s "http://$PUBLIC_IP/api/courses/health" | jq -e --arg c "$OLD" '.colour == $c' > /dev/null
+
+          OLD_IMAGE=$(kubectl get deployment "course-service-$OLD" -n "$NAMESPACE" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')
+
+          {
+            echo "## Automatic rollback"
+            echo ""
+            echo "**Reason:** $ROLLBACK_REASON"
+            echo ""
+            echo "Traffic is back on **$OLD**, running \`$OLD_IMAGE\`."
+            echo "The broken version is still running on **$NEW** (no traffic) so it can be investigated."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::error::Release $IMAGE_TAG was rolled back to $OLD automatically"
+
+      - name: Notify Discord
+        if: ${{ always() && env.DISCORD_WEBHOOK_URL != '' }}
+        env:
+          JOB_STATUS: ${{ job.status }}
+          SMOKE: ${{ steps.smoke.outcome }}
+          WATCH: ${{ steps.watch.outcome }}
+          NEW: ${{ steps.colours.outputs.idle }}
+          OLD: ${{ steps.colours.outputs.live }}
+        run: |
+          SHORT=${IMAGE_TAG:0:7}
+          if [ "$JOB_STATUS" = "success" ]; then
+            MSG="✅ KoalaTech release $SHORT is live on **$NEW** (zero downtime swap)."
+          elif [ "$SMOKE" = "failure" ]; then
+            MSG="🛑 KoalaTech release $SHORT failed the smoke test on **$NEW**. No swap, users stayed on **$OLD**."
+          elif [ "$WATCH" = "failure" ]; then
+            MSG="↩️ KoalaTech release $SHORT was rolled back automatically from **$NEW** to **$OLD**. Reason: ${ROLLBACK_REASON:-unknown}"
+          else
+            MSG="⚠️ KoalaTech production deploy of $SHORT failed. Check the GitHub Actions run."
+          fi
+          jq -n --arg c "$MSG ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" '{content: $c}' \
+            | curl -s -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"
+
+      - name: Release summary
+        if: ${{ always() }}
+        env:
+          OLD: ${{ steps.colours.outputs.live }}
+          NEW: ${{ steps.colours.outputs.idle }}
+        run: |
+          {
+            echo "## Blue/green release"
+            echo ""
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Image tag | \`$IMAGE_TAG\` |"
+            echo "| Demo fault | $DEMO_FAULT |"
+            echo "| Live colour before | $OLD |"
+            echo "| New version deployed to | $NEW |"
+            echo "| Smoke test | ${{ steps.smoke.outcome }} |"
+            echo "| Swap | ${{ steps.swap.outcome }} |"
+            echo "| Watch after swap | ${{ steps.watch.outcome }} |"
+            echo "| Live colour now | $(kubectl get service frontend -n "$NAMESPACE" -o jsonpath='{.spec.selector.version}' 2>/dev/null) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          kubectl get pods -n "$NAMESPACE" -l 'app in (frontend,course-service)' -L version || true
+          kubectl get service frontend course-service frontend-preview course-service-preview \
+            -n "$NAMESPACE" -o custom-columns=NAME:.metadata.name,TYPE:.spec.type,VERSION:.spec.selector.version || true

@@ -1,0 +1,35 @@
+# The PUBLIC services. Their selector includes "version", so the selector is
+# the traffic switch. The pipeline only applies this file once, on the very
+# first release (LIVE_COLOUR=blue). After that it only ever PATCHES the
+# version label, it never re-applies this file (that would reset the switch).
+apiVersion: v1
+kind: Service
+metadata:
+  name: course-service
+  namespace: production
+  labels:
+    app: course-service
+    monitoring: enabled
+spec:
+  selector:
+    app: course-service
+    version: ${LIVE_COLOUR}
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: production
+spec:
+  type: LoadBalancer
+  selector:
+    app: frontend
+    version: ${LIVE_COLOUR}
+  ports:
+    - port: 80
+      targetPort: 80
